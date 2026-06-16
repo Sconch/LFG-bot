@@ -36,6 +36,63 @@ const managedVoiceChannels = new Map(); // channelId -> { timeout } for auto-cle
 
 // ───────────────────────── helpers ─────────────────────────
 
+// Turn "lfg-CS2!" into "lfg cs2" and ["lfg","cs2"] for fuzzy name matching.
+function normalizeName(s) {
+  return String(s || '').toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim();
+}
+function nameTokens(s) {
+  return normalizeName(s).split(' ').filter(Boolean);
+}
+
+// Does a name (channel or category) match one of a game's aliases?
+function nameMatchesAliases(name, aliases) {
+  const tokenSet = new Set(nameTokens(name));
+  const norm = normalizeName(name);
+  for (const alias of aliases) {
+    const at = nameTokens(alias);
+    if (at.length === 0) continue;
+    if (at.length === 1) {
+      if (tokenSet.has(at[0])) return true;           // whole-word match, e.g. "cs2"
+    } else if (norm.includes(at.join(' '))) {
+      return true;                                     // phrase match, e.g. "counter strike"
+    }
+  }
+  return false;
+}
+
+// If a channel's name matches a game (e.g. "lfg-cs2" → cs2), return that key.
+function detectGameKeyFromChannel(channelName) {
+  for (const [key, g] of Object.entries(GAMES)) {
+    const aliases = [key, g.label, ...(g.aliases || [])];
+    if (nameMatchesAliases(channelName, aliases)) return key;
+  }
+  return null;
+}
+
+// Find the Discord category to nest the VC under, by matching its name to the game.
+async function findCategoryId(guild, { gameKey, categoryHint }) {
+  if (gameKey && GAMES[gameKey]?.categoryId) return GAMES[gameKey].categoryId;
+
+  let aliases = [];
+  if (gameKey && GAMES[gameKey]) {
+    const g = GAMES[gameKey];
+    aliases = [gameKey, g.label, ...(g.aliases || [])];
+  } else if (categoryHint) {
+    aliases = [categoryHint];
+  }
+
+  try {
+    const channels = await guild.channels.fetch();
+    for (const ch of channels.values()) {
+      if (ch && ch.type === ChannelType.GuildCategory && nameMatchesAliases(ch.name, aliases)) {
+        return ch.id;
+      }
+    }
+  } catch { /* fall through to default */ }
+
+  return CONFIG.lobbyCategoryId || undefined;
+}
+
 function newLobby(partial) {
   const id = crypto.randomUUID().slice(0, 8);
   const lobby = {
@@ -44,6 +101,8 @@ function newLobby(partial) {
     channelId: partial.channelId,
     messageId: null,
     hostId: partial.hostId,
+    gameKey: partial.gameKey || null,
+    categoryHint: partial.categoryHint || null,
     gameLabel: partial.gameLabel,
     modeLabel: partial.modeLabel,
     size: partial.size,
@@ -72,6 +131,8 @@ function buildEmbed(lobby) {
     0x5865f2;
 
   const statusLine =
+    lobby.status === 'full' && lobby.members.length < lobby.size
+      ? '🟢 **STARTED EARLY** — private voice channel created below!' :
     lobby.status === 'full' ? '🟢 **LOBBY FULL** — private voice channel created below!' :
     lobby.status === 'cancelled' ? '🔴 **Lobby disbanded.**' :
     `🟡 Press ${JOIN_EMOJI} to join!`;
@@ -100,6 +161,12 @@ function buildButtons(lobby) {
       .setEmoji(JOIN_EMOJI)
       .setLabel('Join')
       .setStyle(ButtonStyle.Success)
+      .setDisabled(!open),
+    new ButtonBuilder()
+      .setCustomId(`lfg:start:${lobby.id}`)
+      .setEmoji('▶️')
+      .setLabel('Start now (host)')
+      .setStyle(ButtonStyle.Primary)
       .setDisabled(!open),
     new ButtonBuilder()
       .setCustomId(`lfg:leave:${lobby.id}`)
@@ -143,10 +210,15 @@ async function createPrivateVoiceChannel(guild, lobby) {
     })),
   ];
 
+  const parent = await findCategoryId(guild, {
+    gameKey: lobby.gameKey,
+    categoryHint: lobby.categoryHint,
+  });
+
   const channel = await guild.channels.create({
     name: `🔒 ${lobby.gameLabel} • ${lobby.modeLabel}`.slice(0, 100),
     type: ChannelType.GuildVoice,
-    parent: CONFIG.lobbyCategoryId || undefined,
+    parent: parent || undefined,
     userLimit: lobby.size,
     permissionOverwrites: overwrites,
   });
@@ -156,11 +228,29 @@ async function createPrivateVoiceChannel(guild, lobby) {
   return channel;
 }
 
-// Auto-delete created VCs once they're empty (with a grace period so it's not
-// nuked before anyone joins).
+// Shared "lobby is ready" path: used both when it fills naturally and when the
+// host starts early. Creates the private VC and pings everyone.
+async function fillLobby(lobby, guild, announceChannel, { manual = false } = {}) {
+  lobby.status = 'full';
+  if (lobby._expiry) clearTimeout(lobby._expiry);
+
+  const vc = await createPrivateVoiceChannel(guild, lobby);
+  await refreshLobbyMessage(lobby);
+
+  const mentions = lobby.members.map((id) => `<@${id}>`).join(' ');
+  const tag = manual ? 'started early' : 'is full';
+  await announceChannel.send({
+    content: `🎉 **Lobby #${lobby.id} ${tag}!** ${mentions}\nYour private voice channel → <#${vc.id}>`,
+  });
+  return vc;
+}
+
+// Auto-delete created VCs. Two cases:
+//  - nobody ever joins  → delete after initialEmptyTimeoutMs (default 5 min)
+//  - emptied after use  → delete after emptyChannelGraceMs (default 2 min)
 function trackVoiceChannel(channel) {
-  const timeout = setTimeout(() => deleteIfEmpty(channel.id), CONFIG.emptyChannelGraceMs);
-  managedVoiceChannels.set(channel.id, { timeout });
+  const timeout = setTimeout(() => deleteIfEmpty(channel.id), CONFIG.initialEmptyTimeoutMs);
+  managedVoiceChannels.set(channel.id, { timeout, used: false });
 }
 
 async function deleteIfEmpty(channelId) {
@@ -187,11 +277,13 @@ async function expireLobby(id) {
 
 // ───────────────────────── posting a lobby ─────────────────────────
 
-async function postLobby(interaction, { gameLabel, modeLabel, size, notes }) {
+async function postLobby(interaction, { gameKey, categoryHint, gameLabel, modeLabel, size, notes }) {
   const lobby = newLobby({
     guildId: interaction.guildId,
     channelId: interaction.channelId,
     hostId: interaction.user.id,
+    gameKey,
+    categoryHint,
     gameLabel,
     modeLabel,
     size,
@@ -278,6 +370,28 @@ client.on(Events.InteractionCreate, async (interaction) => {
     if (interaction.isChatInputCommand() && interaction.commandName === 'lfg') {
       const preGame = interaction.options.getString('game');
 
+      // If this channel is named after a game (e.g. "lfg-cs2"), lock it to that game.
+      const lockedGame = CONFIG.lockToChannelGame
+        ? detectGameKeyFromChannel(interaction.channel?.name || '')
+        : null;
+
+      if (lockedGame) {
+        const g = GAMES[lockedGame];
+        // Reject a game option (or custom) that doesn't match this channel.
+        if (preGame && preGame !== lockedGame) {
+          return interaction.reply({
+            content: `🔒 This channel is for **${g.emoji} ${g.label}** only. Use a general LFG channel for other games.`,
+            flags: MessageFlags.Ephemeral,
+          });
+        }
+        // Skip the game picker — go straight to mode selection for this game.
+        return interaction.reply({
+          content: `🔒 **${g.emoji} ${g.label}** (locked to this channel) — pick a mode:`,
+          components: [modeSelectRow(lockedGame)],
+          flags: MessageFlags.Ephemeral,
+        });
+      }
+
       if (preGame === 'custom') {
         return interaction.showModal(customModal());
       }
@@ -314,6 +428,8 @@ client.on(Events.InteractionCreate, async (interaction) => {
       const mode = game.modes[modeKey];
 
       await postLobby(interaction, {
+        gameKey,
+        categoryHint: game.label,
         gameLabel: `${game.emoji} ${game.label}`,
         modeLabel: mode.label,
         size: mode.size,
@@ -340,7 +456,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
         });
       }
 
-      await postLobby(interaction, { gameLabel: `🎮 ${gameName}`, modeLabel: modeName, size, notes });
+      await postLobby(interaction, { gameKey: null, categoryHint: gameName, gameLabel: `🎮 ${gameName}`, modeLabel: modeName, size, notes });
       return interaction.reply({
         content: `✅ Custom lobby posted! People can join with ${JOIN_EMOJI}.`,
         flags: MessageFlags.Ephemeral,
@@ -369,22 +485,28 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
         // Filled up?
         if (lobby.members.length >= lobby.size) {
-          lobby.status = 'full';
-          if (lobby._expiry) clearTimeout(lobby._expiry);
-
           await interaction.deferUpdate();
-          const vc = await createPrivateVoiceChannel(interaction.guild, lobby);
-          await refreshLobbyMessage(lobby);
-
-          const mentions = lobby.members.map((id) => `<@${id}>`).join(' ');
-          await interaction.channel.send({
-            content: `🎉 **Lobby #${lobby.id} is full!** ${mentions}\nYour private voice channel is ready → <#${vc.id}>`,
-          });
+          await fillLobby(lobby, interaction.guild, interaction.channel);
           return;
         }
 
         await refreshLobbyMessage(lobby);
         return interaction.reply({ content: `Joined **Lobby #${lobby.id}**! ✅`, flags: MessageFlags.Ephemeral });
+      }
+
+      // START EARLY (host / mod) — create the VC even if not full
+      if (action === 'start') {
+        const isHost = interaction.user.id === lobby.hostId;
+        const isAdmin = interaction.memberPermissions?.has(PermissionFlagsBits.ManageChannels);
+        if (!isHost && !isAdmin) {
+          return interaction.reply({ content: 'Only the host (👑) or a moderator can start the lobby early.', flags: MessageFlags.Ephemeral });
+        }
+        if (lobby.status !== 'open') {
+          return interaction.reply({ content: '⚠️ This lobby has already started.', flags: MessageFlags.Ephemeral });
+        }
+        await interaction.deferUpdate();
+        await fillLobby(lobby, interaction.guild, interaction.channel, { manual: true });
+        return;
       }
 
       // LEAVE
@@ -443,14 +565,26 @@ client.on(Events.InteractionCreate, async (interaction) => {
   }
 });
 
-// Clean up empty managed voice channels.
-client.on(Events.VoiceStateUpdate, (oldState) => {
-  const chan = oldState.channel;
-  if (chan && managedVoiceChannels.has(chan.id) && chan.members.size === 0) {
-    const entry = managedVoiceChannels.get(chan.id);
-    if (entry?.timeout) clearTimeout(entry.timeout);
-    const timeout = setTimeout(() => deleteIfEmpty(chan.id), CONFIG.emptyChannelGraceMs);
-    managedVoiceChannels.set(chan.id, { timeout });
+// Track joins/leaves on managed VCs to drive cleanup.
+client.on(Events.VoiceStateUpdate, (oldState, newState) => {
+  const joined = newState.channel;
+  const left = oldState.channel;
+
+  // Someone joined a managed channel → mark used, cancel any pending deletion.
+  if (joined && managedVoiceChannels.has(joined.id)) {
+    const entry = managedVoiceChannels.get(joined.id);
+    entry.used = true;
+    if (entry.timeout) { clearTimeout(entry.timeout); entry.timeout = null; }
+  }
+
+  // Someone left a managed channel and it's now empty → start the 2-min timer
+  // (only once it has actually been used, so we don't double-handle creation).
+  if (left && left.id !== joined?.id && managedVoiceChannels.has(left.id) && left.members.size === 0) {
+    const entry = managedVoiceChannels.get(left.id);
+    if (entry.used) {
+      if (entry.timeout) clearTimeout(entry.timeout);
+      entry.timeout = setTimeout(() => deleteIfEmpty(left.id), CONFIG.emptyChannelGraceMs);
+    }
   }
 });
 

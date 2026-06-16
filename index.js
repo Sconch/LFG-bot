@@ -823,6 +823,7 @@ async function registerCommands() {
 
 client.once(Events.ClientReady, async (c) => {
   console.log(`✅ Logged in as ${c.user.tag}. Ready to make lobbies!`);
+  console.log('CS2 modes loaded:', Object.keys(CONFIG.GAMES.cs2.modes).join(', '));
   await registerCommands();
 });
 

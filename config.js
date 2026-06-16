@@ -19,6 +19,7 @@ const GAMES = {
     aliases: ['cs2', 'cs', 'csgo', 'counter-strike', 'counter strike', 'counterstrike'],
     modes: {
       premier:     { label: 'Premier (5-stack)', size: 5 },
+      community5v5: { label: 'Community 5v5 (captains draft)', size: 10, draft: true },
       competitive: { label: 'Competitive',        size: 5 },
       faceit:      { label: 'FACEIT',              size: 5 },
       wingman:     { label: 'Wingman',             size: 2 },

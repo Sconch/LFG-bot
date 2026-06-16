@@ -44,6 +44,26 @@ function nameTokens(s) {
   return normalizeName(s).split(' ').filter(Boolean);
 }
 
+// Best display name available for a user from an interaction.
+function getDisplayName(interaction) {
+  return (
+    interaction.member?.displayName ||
+    interaction.user.globalName ||
+    interaction.user.username ||
+    `Player${interaction.user.id.slice(-4)}`
+  );
+}
+
+// Fisher-Yates shuffle (returns a new array).
+function shuffled(arr) {
+  const a = [...arr];
+  for (let i = a.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [a[i], a[j]] = [a[j], a[i]];
+  }
+  return a;
+}
+
 // Does a name (channel or category) match one of a game's aliases?
 function nameMatchesAliases(name, aliases) {
   const tokenSet = new Set(nameTokens(name));
@@ -108,10 +128,16 @@ function newLobby(partial) {
     size: partial.size,
     notes: partial.notes || null,
     members: [partial.hostId], // host auto-joins
+    names: {},                 // userId -> display name (for draft menus)
+    draft: !!partial.draft,    // is this a captains-draft lobby?
+    draftState: null,          // populated when the draft starts
+    draftMessageId: null,
     voiceChannelId: null,
-    status: 'open', // 'open' | 'full' | 'cancelled'
+    teamVoiceChannelIds: [],   // [teamA VC id, teamB VC id] for draft lobbies
+    status: 'open',            // 'open' | 'drafting' | 'full' | 'cancelled'
     createdAt: Date.now(),
   };
+  lobby.names[partial.hostId] = partial.hostName || 'Host';
   lobbies.set(id, lobby);
 
   if (CONFIG.lobbyExpiryMs > 0) {
@@ -127,13 +153,15 @@ function buildEmbed(lobby) {
 
   const color =
     lobby.status === 'full' ? 0x57f287 :
+    lobby.status === 'drafting' ? 0xfee75c :
     lobby.status === 'cancelled' ? 0xed4245 :
     0x5865f2;
 
   const statusLine =
+    lobby.status === 'drafting' ? '🟠 **DRAFTING** — captains are picking teams below!' :
     lobby.status === 'full' && lobby.members.length < lobby.size
       ? '🟢 **STARTED EARLY** — private voice channel created below!' :
-    lobby.status === 'full' ? '🟢 **LOBBY FULL** — private voice channel created below!' :
+    lobby.status === 'full' ? '🟢 **LOBBY FULL** — see below!' :
     lobby.status === 'cancelled' ? '🔴 **Lobby disbanded.**' :
     `🟡 Press ${JOIN_EMOJI} to join!`;
 
@@ -194,7 +222,7 @@ async function refreshLobbyMessage(lobby) {
   }
 }
 
-async function createPrivateVoiceChannel(guild, lobby) {
+async function createVoiceChannel(guild, lobby, { name, memberIds }) {
   const overwrites = [
     {
       id: guild.roles.everyone.id,
@@ -204,7 +232,7 @@ async function createPrivateVoiceChannel(guild, lobby) {
       id: client.user.id, // make sure the bot can manage/clean up the channel
       allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.Connect, PermissionFlagsBits.ManageChannels],
     },
-    ...lobby.members.map((uid) => ({
+    ...memberIds.map((uid) => ({
       id: uid,
       allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.Connect],
     })),
@@ -216,15 +244,23 @@ async function createPrivateVoiceChannel(guild, lobby) {
   });
 
   const channel = await guild.channels.create({
-    name: `🔒 ${lobby.gameLabel} • ${lobby.modeLabel}`.slice(0, 100),
+    name: name.slice(0, 100),
     type: ChannelType.GuildVoice,
     parent: parent || undefined,
-    userLimit: lobby.size,
+    userLimit: memberIds.length || undefined,
     permissionOverwrites: overwrites,
   });
 
-  lobby.voiceChannelId = channel.id;
   trackVoiceChannel(channel);
+  return channel;
+}
+
+async function createPrivateVoiceChannel(guild, lobby) {
+  const channel = await createVoiceChannel(guild, lobby, {
+    name: `🔒 ${lobby.gameLabel} • ${lobby.modeLabel}`,
+    memberIds: lobby.members,
+  });
+  lobby.voiceChannelId = channel.id;
   return channel;
 }
 
@@ -243,6 +279,116 @@ async function fillLobby(lobby, guild, announceChannel, { manual = false } = {})
     content: `🎉 **Lobby #${lobby.id} ${tag}!** ${mentions}\nYour private voice channel → <#${vc.id}>`,
   });
   return vc;
+}
+
+// ───────────────────────── captains draft ─────────────────────────
+
+function buildDraftEmbed(lobby) {
+  const d = lobby.draftState;
+  const [capA, capB] = d.captains;
+  const nm = (id) => lobby.names[id] || `Player${id.slice(-4)}`;
+
+  const teamLine = (capId) =>
+    d.teams[capId].map((id, i) => `${i === 0 ? '👑 ' : `\`${i}.\` `}<@${id}>`).join('\n') || '*empty*';
+
+  const poolLine = d.pool.length
+    ? d.pool.map((id) => `• <@${id}>`).join('\n')
+    : '*— everyone has been picked —*';
+
+  const done = d.pool.length === 0;
+  const current = d.pickOrder[d.turnIndex];
+  const desc = done
+    ? '✅ **Draft complete!** Teams are set — jump into your voice channel below.'
+    : `🎲 Captains chosen at random.\n\n**On the clock:** <@${current}> — pick a player from the dropdown.`;
+
+  return new EmbedBuilder()
+    .setColor(done ? 0x57f287 : 0xfaa61a)
+    .setTitle(`🎖️ Captains Draft — ${lobby.gameLabel} ${lobby.modeLabel}`)
+    .setDescription(desc)
+    .addFields(
+      { name: `🅰️ ${nm(capA)}'s Team`, value: teamLine(capA), inline: true },
+      { name: `🅱️ ${nm(capB)}'s Team`, value: teamLine(capB), inline: true },
+      { name: '🎯 Available', value: poolLine },
+    )
+    .setFooter({ text: `Lobby #${lobby.id}` });
+}
+
+function buildDraftComponents(lobby) {
+  const d = lobby.draftState;
+  if (d.pool.length === 0) return []; // draft finished — no menu
+
+  const current = d.pickOrder[d.turnIndex];
+  const menu = new StringSelectMenuBuilder()
+    .setCustomId(`lfg:pick:${lobby.id}`)
+    .setPlaceholder(`${lobby.names[current] || 'Captain'}, pick a player…`);
+
+  for (const id of d.pool) {
+    menu.addOptions(
+      new StringSelectMenuOptionBuilder()
+        .setLabel((lobby.names[id] || `Player${id.slice(-4)}`).slice(0, 100))
+        .setValue(id),
+    );
+  }
+  return [new ActionRowBuilder().addComponents(menu)];
+}
+
+async function startDraft(lobby, guild, announceChannel) {
+  lobby.status = 'drafting';
+  if (lobby._expiry) clearTimeout(lobby._expiry);
+
+  // Pick 2 random captains; the rest go into the pool.
+  const order = shuffled(lobby.members);
+  const captains = [order[0], order[1]];
+  const pool = order.slice(2);
+
+  // Alternating pick order: A, B, A, B, … for however many are in the pool.
+  const pickOrder = pool.map((_, i) => captains[i % 2]);
+
+  lobby.draftState = {
+    captains,
+    teams: { [captains[0]]: [captains[0]], [captains[1]]: [captains[1]] },
+    pool,
+    pickOrder,
+    turnIndex: 0,
+  };
+
+  await refreshLobbyMessage(lobby); // disables the old buttons, shows "DRAFTING"
+
+  const msg = await announceChannel.send({
+    content: `🎖️ **Draft time!** Captains: <@${captains[0]}> 🅰️ vs <@${captains[1]}> 🅱️`,
+    embeds: [buildDraftEmbed(lobby)],
+    components: buildDraftComponents(lobby),
+  });
+  lobby.draftMessageId = msg.id;
+
+  // If nobody to draft (e.g. early start with only 2), finish immediately.
+  if (pool.length === 0) await finalizeDraft(lobby, guild, announceChannel);
+}
+
+async function finalizeDraft(lobby, guild, announceChannel) {
+  const d = lobby.draftState;
+  const [capA, capB] = d.captains;
+  lobby.status = 'full';
+
+  const vcA = await createVoiceChannel(guild, lobby, {
+    name: `🅰️ ${lobby.names[capA] || 'Team A'}`,
+    memberIds: d.teams[capA],
+  });
+  const vcB = await createVoiceChannel(guild, lobby, {
+    name: `🅱️ ${lobby.names[capB] || 'Team B'}`,
+    memberIds: d.teams[capB],
+  });
+  lobby.teamVoiceChannelIds = [vcA.id, vcB.id];
+
+  const aMentions = d.teams[capA].map((id) => `<@${id}>`).join(' ');
+  const bMentions = d.teams[capB].map((id) => `<@${id}>`).join(' ');
+  await announceChannel.send({
+    content:
+      `✅ **Teams are set for Lobby #${lobby.id}!**\n` +
+      `🅰️ ${aMentions} → <#${vcA.id}>\n` +
+      `🅱️ ${bMentions} → <#${vcB.id}>`,
+  });
+  return { vcA, vcB };
 }
 
 // Auto-delete created VCs. Two cases:
@@ -277,17 +423,19 @@ async function expireLobby(id) {
 
 // ───────────────────────── posting a lobby ─────────────────────────
 
-async function postLobby(interaction, { gameKey, categoryHint, gameLabel, modeLabel, size, notes }) {
+async function postLobby(interaction, { gameKey, categoryHint, gameLabel, modeLabel, size, notes, draft }) {
   const lobby = newLobby({
     guildId: interaction.guildId,
     channelId: interaction.channelId,
     hostId: interaction.user.id,
+    hostName: getDisplayName(interaction),
     gameKey,
     categoryHint,
     gameLabel,
     modeLabel,
     size,
     notes,
+    draft,
   });
 
   const message = await interaction.channel.send({
@@ -433,6 +581,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
         gameLabel: `${game.emoji} ${game.label}`,
         modeLabel: mode.label,
         size: mode.size,
+        draft: !!mode.draft,
       });
 
       return interaction.update({
@@ -482,11 +631,13 @@ client.on(Events.InteractionCreate, async (interaction) => {
         }
 
         lobby.members.push(interaction.user.id);
+        lobby.names[interaction.user.id] = getDisplayName(interaction);
 
         // Filled up?
         if (lobby.members.length >= lobby.size) {
           await interaction.deferUpdate();
-          await fillLobby(lobby, interaction.guild, interaction.channel);
+          if (lobby.draft) await startDraft(lobby, interaction.guild, interaction.channel);
+          else await fillLobby(lobby, interaction.guild, interaction.channel);
           return;
         }
 
@@ -504,8 +655,47 @@ client.on(Events.InteractionCreate, async (interaction) => {
         if (lobby.status !== 'open') {
           return interaction.reply({ content: '⚠️ This lobby has already started.', flags: MessageFlags.Ephemeral });
         }
+        if (lobby.draft && lobby.members.length < 4) {
+          return interaction.reply({ content: 'You need at least 4 players to start a captains draft.', flags: MessageFlags.Ephemeral });
+        }
         await interaction.deferUpdate();
-        await fillLobby(lobby, interaction.guild, interaction.channel, { manual: true });
+        if (lobby.draft) await startDraft(lobby, interaction.guild, interaction.channel);
+        else await fillLobby(lobby, interaction.guild, interaction.channel, { manual: true });
+        return;
+      }
+
+      // DRAFT PICK (captain selects a player)
+      if (action === 'pick') {
+        if (lobby.status !== 'drafting' || !lobby.draftState) {
+          return interaction.reply({ content: '⚠️ This draft isn’t active.', flags: MessageFlags.Ephemeral });
+        }
+        const d = lobby.draftState;
+        const current = d.pickOrder[d.turnIndex];
+        if (interaction.user.id !== current) {
+          const youCaptain = d.captains.includes(interaction.user.id);
+          return interaction.reply({
+            content: youCaptain ? '⏳ It’s the other captain’s turn to pick.' : 'Only the captain on the clock can pick right now.',
+            flags: MessageFlags.Ephemeral,
+          });
+        }
+
+        const pickedId = interaction.values[0];
+        if (!d.pool.includes(pickedId)) {
+          return interaction.reply({ content: 'That player was just taken — pick again.', flags: MessageFlags.Ephemeral });
+        }
+
+        // Apply the pick.
+        d.pool = d.pool.filter((id) => id !== pickedId);
+        d.teams[current].push(pickedId);
+        d.turnIndex += 1;
+
+        if (d.pool.length === 0) {
+          await interaction.deferUpdate();
+          await finalizeDraft(lobby, interaction.guild, interaction.channel);
+          await interaction.editReply({ embeds: [buildDraftEmbed(lobby)], components: [] });
+        } else {
+          await interaction.update({ embeds: [buildDraftEmbed(lobby)], components: buildDraftComponents(lobby) });
+        }
         return;
       }
 
@@ -543,13 +733,23 @@ client.on(Events.InteractionCreate, async (interaction) => {
         lobby.status = 'cancelled';
         if (lobby._expiry) clearTimeout(lobby._expiry);
 
-        // Tear down the VC if one was created.
-        if (lobby.voiceChannelId) {
+        // Tear down any VCs this lobby created (single or both team channels).
+        const vcIds = [lobby.voiceChannelId, ...lobby.teamVoiceChannelIds].filter(Boolean);
+        for (const vcId of vcIds) {
           try {
-            const vc = await client.channels.fetch(lobby.voiceChannelId);
+            const vc = await client.channels.fetch(vcId);
             await vc.delete('Lobby disbanded by host.');
-            managedVoiceChannels.delete(lobby.voiceChannelId);
           } catch { /* already gone */ }
+          managedVoiceChannels.delete(vcId);
+        }
+
+        // If a draft was in progress, close out its message too.
+        if (lobby.draftMessageId) {
+          try {
+            const ch = await client.channels.fetch(lobby.channelId);
+            const dmsg = await ch.messages.fetch(lobby.draftMessageId);
+            await dmsg.edit({ content: '🔴 Draft cancelled (lobby disbanded).', embeds: [], components: [] });
+          } catch { /* ignore */ }
         }
 
         await refreshLobbyMessage(lobby);

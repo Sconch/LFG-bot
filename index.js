@@ -590,6 +590,44 @@ client.on(Events.InteractionCreate, async (interaction) => {
       });
     }
 
+    // Draft pick (a captain selects a player from the dropdown)
+    if (interaction.isStringSelectMenu() && interaction.customId.startsWith('lfg:pick:')) {
+      const lobbyId = interaction.customId.split(':')[2];
+      const lobby = lobbies.get(lobbyId);
+      if (!lobby || lobby.status !== 'drafting' || !lobby.draftState) {
+        return interaction.reply({ content: '⚠️ This draft isn’t active anymore.', flags: MessageFlags.Ephemeral });
+      }
+
+      const d = lobby.draftState;
+      const current = d.pickOrder[d.turnIndex];
+      if (interaction.user.id !== current) {
+        const youCaptain = d.captains.includes(interaction.user.id);
+        return interaction.reply({
+          content: youCaptain ? '⏳ It’s the other captain’s turn to pick.' : 'Only the captain on the clock can pick right now.',
+          flags: MessageFlags.Ephemeral,
+        });
+      }
+
+      const pickedId = interaction.values[0];
+      if (!d.pool.includes(pickedId)) {
+        return interaction.reply({ content: 'That player was just taken — pick again.', flags: MessageFlags.Ephemeral });
+      }
+
+      // Apply the pick.
+      d.pool = d.pool.filter((id) => id !== pickedId);
+      d.teams[current].push(pickedId);
+      d.turnIndex += 1;
+
+      if (d.pool.length === 0) {
+        await interaction.deferUpdate();
+        await finalizeDraft(lobby, interaction.guild, interaction.channel);
+        await interaction.editReply({ embeds: [buildDraftEmbed(lobby)], components: [] });
+      } else {
+        await interaction.update({ embeds: [buildDraftEmbed(lobby)], components: buildDraftComponents(lobby) });
+      }
+      return;
+    }
+
     // Custom modal submitted
     if (interaction.isModalSubmit() && interaction.customId === 'lfg:custommodal') {
       const gameName = interaction.fields.getTextInputValue('game').trim();
@@ -661,41 +699,6 @@ client.on(Events.InteractionCreate, async (interaction) => {
         await interaction.deferUpdate();
         if (lobby.draft) await startDraft(lobby, interaction.guild, interaction.channel);
         else await fillLobby(lobby, interaction.guild, interaction.channel, { manual: true });
-        return;
-      }
-
-      // DRAFT PICK (captain selects a player)
-      if (action === 'pick') {
-        if (lobby.status !== 'drafting' || !lobby.draftState) {
-          return interaction.reply({ content: '⚠️ This draft isn’t active.', flags: MessageFlags.Ephemeral });
-        }
-        const d = lobby.draftState;
-        const current = d.pickOrder[d.turnIndex];
-        if (interaction.user.id !== current) {
-          const youCaptain = d.captains.includes(interaction.user.id);
-          return interaction.reply({
-            content: youCaptain ? '⏳ It’s the other captain’s turn to pick.' : 'Only the captain on the clock can pick right now.',
-            flags: MessageFlags.Ephemeral,
-          });
-        }
-
-        const pickedId = interaction.values[0];
-        if (!d.pool.includes(pickedId)) {
-          return interaction.reply({ content: 'That player was just taken — pick again.', flags: MessageFlags.Ephemeral });
-        }
-
-        // Apply the pick.
-        d.pool = d.pool.filter((id) => id !== pickedId);
-        d.teams[current].push(pickedId);
-        d.turnIndex += 1;
-
-        if (d.pool.length === 0) {
-          await interaction.deferUpdate();
-          await finalizeDraft(lobby, interaction.guild, interaction.channel);
-          await interaction.editReply({ embeds: [buildDraftEmbed(lobby)], components: [] });
-        } else {
-          await interaction.update({ embeds: [buildDraftEmbed(lobby)], components: buildDraftComponents(lobby) });
-        }
         return;
       }
 
